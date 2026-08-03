@@ -1,0 +1,384 @@
+% =====================================================================
+%  Energy-Based Models: Theory and Implementation
+%  Drop-in content for the "Classical EBM" and "Langevin Dynamics" sections.
+%
+%  Requires in the preamble:
+%     \usepackage{amsmath, amssymb}
+%     \usepackage{listings}      % for the code snippets (optional)
+%     \usepackage{booktabs}      % for the mapping tables
+%     \usepackage{hyperref}
+%
+%  If you do not want the code listings, delete the \begin{lstlisting} blocks;
+%  the prose and equations stand on their own.
+% =====================================================================
+
+\section{Classical Energy-Based Models}
+
+\subsection{Definition: from energy to probability}
+
+An energy-based model (EBM) specifies a probability distribution over a data space
+$\mathcal{X} \subseteq \mathbb{R}^{d}$ through a single scalar-valued
+\emph{energy function} $E_\theta : \mathcal{X} \to \mathbb{R}$, parameterised by
+$\theta$. The associated density follows the Boltzmann--Gibbs form
+\begin{equation}
+  p_\theta(x) \;=\; \frac{1}{Z(\theta)}\, e^{-E_\theta(x)},
+  \qquad
+  Z(\theta) \;=\; \int_{\mathcal{X}} e^{-E_\theta(x)}\, dx,
+  \label{eq:ebm}
+\end{equation}
+where $Z(\theta)$ is the \emph{partition function} (normalising constant). The negative
+sign in the exponent encodes the defining convention of an EBM: \emph{low energy
+corresponds to high probability}. Configurations that resemble the data are assigned low
+energy; implausible configurations are assigned high energy. The model is not a
+classifier and never emits a label---it emits a single number quantifying how
+``data-like'' its input is.
+
+In our implementation the energy $E_\theta$ is a convolutional neural network mapping a
+$1\times28\times28$ image to one scalar ($d = 784$). The forward pass \emph{is}
+$E_\theta(x)$:
+\begin{lstlisting}[language=Python]
+# model.py -- CNNModel.forward
+def forward(self, x):
+    return self.cnn_layers(x).squeeze(dim=-1)  # (B,1,28,28) -> (B,)  one scalar E per image
+\end{lstlisting}
+
+\subsection{The intractability of the partition function}
+
+The integral defining $Z(\theta)$ in \eqref{eq:ebm} ranges over the entire
+$d$-dimensional space. For $d = 784$ there is no closed form (the integrand is a deep
+nonlinear network) and numerical quadrature is infeasible by the curse of dimensionality.
+Consequently $Z(\theta)$---and with it the density $p_\theta(x)$ itself---cannot be
+evaluated. In particular, the log-likelihood
+\begin{equation}
+  \log p_\theta(x) \;=\; -\,E_\theta(x) \;-\; \log Z(\theta)
+  \label{eq:loglik}
+\end{equation}
+carries the uncomputable term $\log Z(\theta)$, so na\"ive maximum-likelihood estimation
+is unavailable.
+
+Two consequences follow, and they structure the entire method. First, the energy is
+identifiable only \emph{up to an additive constant}: shifting $E_\theta \mapsto E_\theta +
+c$ leaves $p_\theta$ invariant while rescaling $Z \mapsto Z e^{-c}$. Only \emph{differences}
+and \emph{gradients} of the energy are physically meaningful; the absolute level is a
+gauge freedom. Second, every subsequent design choice exists to \emph{avoid ever
+computing} $Z$. Accordingly, the quantities $Z$, $p_\theta$, and $\log p_\theta$ appear
+nowhere in the implementation---their absence is by design.
+
+\subsection{The score function}
+
+The first escape from $Z$ is obtained by differentiating the log-density with respect to
+the \emph{input} $x$ (not the parameters). Since $Z(\theta)$ is independent of $x$, its
+gradient vanishes:
+\begin{equation}
+  \nabla_x \log p_\theta(x)
+  \;=\; -\,\nabla_x E_\theta(x) \;-\; \underbrace{\nabla_x \log Z(\theta)}_{=\,0}
+  \;=\; -\,\nabla_x E_\theta(x).
+  \label{eq:score}
+\end{equation}
+The quantity $s_\theta(x) := \nabla_x \log p_\theta(x) = -\nabla_x E_\theta(x)$ is the
+\emph{(Stein) score}. Although the density is inaccessible, its \emph{shape}---the
+direction of steepest increase in probability---is a simple backpropagation through the
+network, entirely free of $Z$. The score $-\nabla_x E_\theta$ points towards regions of
+higher probability (more data-like), and $+\nabla_x E_\theta$ points away from them.
+
+In code, the input gradient $\nabla_x E_\theta$ is provided by the model, with an
+implementation-specific stabilising clamp (discussed below):
+\begin{lstlisting}[language=Python]
+# model.py -- CNNModel.gradient
+def gradient(self, x):
+    g = super().gradient(x)                     # = grad_x E(x)  via autograd
+    if self.grad_clamp is not None:
+        g = g.clamp(-self.grad_clamp, self.grad_clamp)
+    return g
+\end{lstlisting}
+
+It is essential to distinguish the two gradients that arise in EBMs:
+$\nabla_x E_\theta$ (with respect to the \emph{input}; free of $Z$; used for sampling) and
+$\nabla_\theta \log Z$ (with respect to the \emph{parameters}; the residual difficulty;
+addressed in training). The former makes generation tractable; the latter is handled in
+Section~\ref{sec:cd}.
+
+% =====================================================================
+\section{Langevin Dynamics}
+\label{sec:langevin}
+
+\subsection{Sampling via the score}
+
+Knowing the score enables sampling. \emph{Langevin dynamics} is a Markov chain Monte Carlo
+scheme whose stationary distribution is exactly $p_\theta$. Starting from an arbitrary
+$x_0$, one iterates
+\begin{equation}
+  x_{t+1} \;=\; x_t \;-\; \frac{\eta}{2}\,\nabla_x E_\theta(x_t)
+                        \;+\; \sqrt{\eta}\;\epsilon_t,
+  \qquad \epsilon_t \sim \mathcal{N}(0, I),
+  \label{eq:langevin}
+\end{equation}
+which is the Euler--Maruyama discretisation of the overdamped Langevin stochastic
+differential equation $dx = -\tfrac12\nabla_x E_\theta(x)\,dt + dW_t$. In the limit
+$\eta \to 0$ and $t \to \infty$, the law of $x_t$ converges to $p_\theta$.
+
+The update comprises two competing terms. The \emph{drift} $-\tfrac{\eta}{2}\nabla_x
+E_\theta$ is the score of \eqref{eq:score}; it pulls the state downhill in energy, towards
+the data manifold (exploitation). The \emph{diffusion} $\sqrt{\eta}\,\epsilon_t$ is an
+isotropic Gaussian perturbation; it prevents collapse to a single mode and lets the chain
+traverse the distribution (exploration). Absent the diffusion term, the recursion reduces
+to deterministic gradient descent and every trajectory converges to the same local
+minimum---the failure mode of \emph{mode collapse}. The balance between drift and
+diffusion therefore governs sample diversity.
+
+\subsection{Implementation and its deviations from the canonical form}
+
+The sampler realises \eqref{eq:langevin} as a loop; the drift is evaluated through
+\texttt{model.gradient}, i.e.\ the clamped score:
+\begin{lstlisting}[language=Python]
+# sampler.py -- generate_samples (core loop)
+for i in range(steps):
+    noise_buf.normal_(0, std)        # epsilon ~ N(0, std^2)
+    inp_imgs.add_(noise_buf)         #  <-- DIFFUSION (added first; see below)
+    inp_imgs.clamp_(min=-1.0, max=1.0)
+
+    grad = model.gradient(inp_imgs)  # grad_x E  (the score, negated)
+    inp_imgs.add_(-step_size * grad) #  <-- DRIFT: x <- x - eta * grad_x E
+    inp_imgs.clamp_(min=-1.0, max=1.0)
+\end{lstlisting}
+
+Our implementation departs from the canonical recursion \eqref{eq:langevin} in three
+deliberate respects. These trade mathematical exactness for empirical stability and
+diversity, and they should be understood as engineering choices rather than approximations
+justified by theory.
+
+\begin{enumerate}
+  \item \textbf{Noise precedes the gradient evaluation.} Whereas \eqref{eq:langevin}
+    evaluates $\nabla_x E_\theta$ at $x_t$ and then adds noise, the implementation perturbs
+    the state first and evaluates the gradient at the perturbed point:
+    \begin{equation}
+      x_{t+1} \;=\; \bigl(x_t + \sqrt{\eta}\,\epsilon_t\bigr)
+                     \;-\; \eta\,\nabla_x E_\theta\bigl(x_t + \sqrt{\eta}\,\epsilon_t\bigr).
+      \label{eq:langevin-impl}
+    \end{equation}
+    This is an alternative, still valid, discretisation of the same SDE. Injecting the
+    stochasticity \emph{into} the gradient evaluation decorrelates parallel chains more
+    strongly and was found to be decisive in eliminating mode collapse in practice.
+
+  \item \textbf{Decoupled step sizes.} The canonical form couples the drift and diffusion
+    scales as $\eta/2$ and $\sqrt{\eta}$, a relationship required for convergence to
+    $p_\theta$. The implementation uses two \emph{independent} constants---a large drift
+    step \texttt{step\_size} ($\eta = 10$) and a small noise scale \texttt{noise}
+    ($\approx 5\times10^{-3}$). The resulting chain is therefore an \emph{approximate}
+    sampler, closer in spirit to a stochastically regularised energy minimiser than to an
+    asymptotically exact MCMC scheme.
+
+  \item \textbf{Gradient clamping.} The per-step input gradient is clipped elementwise to
+    $[-0.03,\,0.03]$ inside \texttt{model.gradient} (see the snippet above). This has no
+    counterpart in \eqref{eq:langevin}; it caps the displacement of any single coordinate
+    per step, preventing the chain from diverging and---critically---keeping the replay
+    buffer (Section~\ref{sec:cd}) free of corrupted samples.
+\end{enumerate}
+
+Optionally, the noise scale is \emph{annealed} across the chain, decaying linearly from a
+large initial value to a small final one,
+\begin{equation}
+  \sigma_t \;=\; \sigma_{\mathrm{start}}
+    + \frac{t}{T-1}\bigl(\sigma_{\mathrm{end}} - \sigma_{\mathrm{start}}\bigr),
+  \label{eq:anneal}
+\end{equation}
+so that early steps explore broadly (promoting diversity) and late steps settle cleanly
+(reducing residual noise). Setting $\sigma_{\mathrm{start}} = \sigma_{\mathrm{end}}$
+recovers the constant-noise scheme.
+
+% =====================================================================
+\section{Training by Contrastive Divergence}
+\label{sec:cd}
+
+\subsection{The maximum-likelihood gradient}
+
+Training seeks parameters maximising the expected log-likelihood of the data,
+$\max_\theta \mathbb{E}_{x\sim p_{\mathrm{data}}}[\log p_\theta(x)]$. Differentiating
+\eqref{eq:loglik} with respect to $\theta$ retains the partition term, but that term admits
+a tractable identity. Using $\nabla_\theta \log Z(\theta) = \frac{1}{Z}\int
+e^{-E_\theta}(-\nabla_\theta E_\theta)\,dx = -\,\mathbb{E}_{x\sim p_\theta}[\nabla_\theta
+E_\theta(x)]$, one obtains
+\begin{equation}
+  \nabla_\theta\, \mathbb{E}_{p_{\mathrm{data}}}[\log p_\theta(x)]
+  \;=\;
+  -\,\mathbb{E}_{x\sim p_{\mathrm{data}}}\!\bigl[\nabla_\theta E_\theta(x)\bigr]
+  \;+\; \mathbb{E}_{x\sim p_\theta}\!\bigl[\nabla_\theta E_\theta(x)\bigr].
+  \label{eq:mle-grad}
+\end{equation}
+Equivalently, minimising the negative log-likelihood corresponds to the
+\emph{contrastive-divergence} objective
+\begin{equation}
+  \mathcal{L}_{\mathrm{CD}}
+  \;=\;
+  \underbrace{\mathbb{E}_{x\sim p_{\mathrm{data}}}\!\bigl[E_\theta(x)\bigr]}_{\text{lower energy of real data}}
+  \;-\;
+  \underbrace{\mathbb{E}_{x\sim p_\theta}\!\bigl[E_\theta(x)\bigr]}_{\text{raise energy of model samples}}.
+  \label{eq:cd}
+\end{equation}
+The two terms act antagonistically: the positive phase depresses the energy of data
+(``positive'') samples, while the negative phase elevates the energy of samples drawn from
+the model (``negatives''). At the optimum $p_\theta = p_{\mathrm{data}}$, the two
+expectations coincide and the gradient vanishes; the energies of real and generated
+batches become statistically indistinguishable. A vanishing training gap is therefore a
+\emph{signature of convergence}, not of failure---a point of practical importance when
+monitoring training.
+
+The intractable expectation over $p_\theta$ in \eqref{eq:cd} is precisely what Langevin
+dynamics supplies. Contrastive divergence approximates it with negatives obtained from a
+\emph{finite} number $k$ of Langevin steps rather than from an exact draw:
+\begin{equation}
+  \mathbb{E}_{x\sim p_\theta}[E_\theta(x)] \;\approx\; E_\theta(x^-),
+  \qquad x^- = \mathrm{Langevin}(x_0,\,k).
+  \label{eq:cd-approx}
+\end{equation}
+
+The loss is realised directly, with the sign convention adopted here (the network returns
+$E_\theta$; hence the ordering $E_{\mathrm{real}} - E_{\mathrm{fake}}$):
+\begin{lstlisting}[language=Python]
+# train.py -- cd_step
+fake_imgs = sampler.sample_new_exmps(steps=config["cd_steps"], ...)   # x^- ~ p_theta
+real_energy, fake_energy = model(inp_imgs).chunk(2, dim=0)            # E(real), E(fake)
+cdiv_loss = real_energy.mean() - fake_energy.mean()                  # L_CD
+\end{lstlisting}
+
+\paragraph{Energy-scale regularisation.} Because \eqref{eq:cd} constrains only the
+\emph{difference} of energies, the absolute scale---the gauge freedom noted after
+\eqref{eq:loglik}---remains unpinned and may drift without bound. A quadratic penalty is
+therefore added,
+\begin{equation}
+  \mathcal{L} \;=\; \mathcal{L}_{\mathrm{CD}}
+    \;+\; \alpha\Bigl(\mathbb{E}[E_\theta(x^+)^2] + \mathbb{E}[E_\theta(x^-)^2]\Bigr),
+  \label{eq:reg}
+\end{equation}
+which anchors the energies near zero. This term is a stabiliser and does not arise from
+the maximum-likelihood derivation.
+
+\subsection{Persistent negatives: the replay buffer}
+
+A finite $k$ (here $k=60$) is far too small to produce a faithful sample of $p_\theta$ when
+each chain is initialised from noise. \emph{Persistent contrastive divergence} circumvents
+this by maintaining a buffer of past negatives and resuming the chains from it, so that
+across training steps the chains accumulate an effectively unbounded number of Langevin
+iterations. To prevent staleness, a small fraction of each batch is re-initialised from
+noise:
+\begin{equation}
+  x_0 \;=\;
+  \begin{cases}
+    \text{fresh noise}, & \text{with probability } \rho \;(=0.05),\\[2pt]
+    \text{resumed from buffer}, & \text{with probability } 1-\rho.
+  \end{cases}
+  \label{eq:buffer}
+\end{equation}
+After refinement, the negatives are written back into the buffer. The fidelity of the
+entire training signal rests on the buffer remaining populated with high-quality samples;
+this is the reason the gradient clamp of Section~\ref{sec:langevin} is indispensable.
+
+\begin{lstlisting}[language=Python]
+# sampler.py -- sample_new_exmps
+n_new    = np.random.binomial(self.sample_size, self.new_sample_ratio)  # ~5% fresh
+rand_imgs = torch.rand((n_new,) + self.img_shape) * 2 - 1               # fresh noise
+old_imgs  = torch.cat(random.choices(self.examples, k=self.sample_size - n_new))
+inp_imgs  = torch.cat([rand_imgs, old_imgs]).detach().to(self.device)
+inp_imgs  = Sampler.generate_samples(self.model, inp_imgs, steps=steps, ...)  # k steps
+self.examples = list(inp_imgs.cpu().chunk(self.sample_size)) + self.examples  # persist
+self.examples = self.examples[:self.max_len]
+\end{lstlisting}
+
+\subsection{Parameter update for a non-stationary objective}
+
+The parameter update is stochastic gradient descent via Adam. Two choices are specific to
+the EBM setting. First, the momentum coefficient is set to $\beta_1 = 0$: because the
+negatives are drawn from $p_\theta$, the loss surface itself shifts as $\theta$ changes,
+rendering the momentum average of \emph{past} gradients stale. With $\beta_1 = 0$, Adam
+reduces to an RMSProp-like rule that responds only to the current gradient. Second, the
+parameter-gradient norm is clipped to a small value ($0.1$), preventing any single batch
+of negatives from inducing a destabilising update:
+\begin{equation}
+  g \;\leftarrow\; g\,\min\!\Bigl(1,\, \tfrac{c}{\|g\|}\Bigr),\quad c = 0.1,
+  \qquad
+  \theta \;\leftarrow\; \mathrm{Adam}_{\beta_1=0}(\theta,\, g).
+  \label{eq:update}
+\end{equation}
+We emphasise that this parameter clip (on $\nabla_\theta \mathcal{L}$) is distinct from the
+input-gradient clamp of Section~\ref{sec:langevin} (on $\nabla_x E_\theta$): they act on
+different gradients, in different places, and serve different purposes.
+
+\begin{lstlisting}[language=Python]
+# train.py -- main loop
+optimizer.zero_grad()
+loss.backward()                                                    # grad_theta L
+torch.nn.utils.clip_grad_norm_(model.parameters(), config["grad_clip"])  # ||.|| <= 0.1
+optimizer.step()                                                   # theta <- Adam update
+scheduler.step()                                                   # lr *= 0.97 per epoch
+\end{lstlisting}
+
+% =====================================================================
+\section{The Complete Algorithm}
+
+The training procedure interleaves sampling and learning. Each step draws negatives from
+the persistent buffer \eqref{eq:buffer}, refines them by $k$ Langevin iterations
+\eqref{eq:langevin-impl} using the clamped score, evaluates the regularised
+contrastive-divergence loss \eqref{eq:cd}--\eqref{eq:reg}, and updates $\theta$ under the
+non-stationary-aware rule \eqref{eq:update}. Crucially, the Langevin chain runs \emph{inside}
+each parameter update: sampling is nested within training. Sampling and learning are the
+same machinery directed to two ends---the input gradient shapes the samples, the parameter
+gradient shapes the landscape---bound together by the single energy function $E_\theta$.
+
+\begin{table}[h]
+\centering
+\begin{tabular}{@{}lll@{}}
+\toprule
+Stage & Equation & Location \\
+\midrule
+Energy $E_\theta$            & \eqref{eq:ebm}                 & \texttt{model.py:forward} \\
+Score $-\nabla_x E$          & \eqref{eq:score}               & \texttt{model.py:gradient} \\
+Langevin refinement          & \eqref{eq:langevin-impl}       & \texttt{sampler.py:generate\_samples} \\
+Replay buffer                & \eqref{eq:buffer}              & \texttt{sampler.py:sample\_new\_exmps} \\
+CD loss $+$ regulariser      & \eqref{eq:cd},\,\eqref{eq:reg} & \texttt{train.py:cd\_step} \\
+Parameter update             & \eqref{eq:update}              & \texttt{train.py:main} \\
+Partition function $Z$       & ---                            & (never computed, by design) \\
+\bottomrule
+\end{tabular}
+\caption{Correspondence between the mathematical formulation and the implementation.}
+\end{table}
+
+% =====================================================================
+\section{Inference (Generation)}
+\label{sec:inference}
+
+Generation is Langevin dynamics on the trained, \emph{frozen} energy. Starting from noise,
+one iterates \eqref{eq:langevin-impl} for $T$ steps with $\theta$ fixed:
+\begin{equation}
+  x_0 \sim \mathcal{U}(-1,1)^d,
+  \qquad
+  x_{t+1} = \mathrm{Langevin}(x_t),\quad t = 0,\dots,T-1,
+  \qquad \hat{x} = x_T.
+  \label{eq:inference}
+\end{equation}
+No new mechanism is introduced: inference invokes the \emph{same} sampler used to generate
+training negatives, with parameter gradients disabled. It therefore exercises only the
+sampling half of the method (the score and Langevin dynamics), not the learning half.
+
+\begin{lstlisting}[language=Python]
+# inference.py
+start   = torch.rand((N_SAMPLES,) + img_shape) * 2 - 1     # x_0 ~ noise
+samples = Sampler.generate_samples(model, start, steps=N_STEPS,
+                                   step_size=STEP_SIZE, noise=NOISE, ...)
+\end{lstlisting}
+
+Three conditions distinguish inference from the sampling performed during training, and
+they account for the empirically observed difficulty of generation. (i) \emph{Cold start:}
+training negatives resume from a buffer carrying the history of many prior steps, whereas
+inference begins from fresh noise with only $T$ steps available; the energy landscape is
+navigable from the buffer's occupied regions but not necessarily from arbitrary noise.
+(ii) \emph{Frozen parameters:} during inference the landscape is static and only the input
+evolves. (iii) \emph{Free hyperparameters:} the step size, noise scale, and step count may
+be chosen at will; an excessive ratio of drift to diffusion collapses the chain to a single
+mode, formally when $\eta\|\nabla_x E\| \gg \sqrt{\eta}\,\|\epsilon\|$. Sample diversity may
+be quantified by the mean pairwise distance $\frac{1}{N^2}\sum_{i,j}\|x_i - x_j\|_2$, which
+approaches zero under collapse.
+
+In summary, Sections~\ref{sec:langevin}--\ref{sec:cd} construct and train the energy
+$E_\theta$, while inference (Section~\ref{sec:inference}) applies the sampling subroutine
+alone to the frozen result. The same energy function that assigns scores during training is
+the one descended by Langevin dynamics at generation time.

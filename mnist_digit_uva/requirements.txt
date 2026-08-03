@@ -1,0 +1,12 @@
+# FashionMNIST EBM — pinned to versions this project was verified on.
+# Install:  pip install -r requirements.txt
+#
+# On a CUDA server, install the matching CUDA build of torch from pytorch.org first
+# if these CPU/default wheels don't pick up your GPU.
+
+torch==2.13.0
+torchvision==0.28.0
+torchebm==0.7.5
+numpy==2.5.1
+matplotlib==3.11.0
+tqdm==4.68.4

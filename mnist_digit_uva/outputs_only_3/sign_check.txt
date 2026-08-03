@@ -1,0 +1,4 @@
+E(real)  = -0.001
+E(noise) = +2.475
+real < noise ? True
+OK: low energy = data. inference.py works as-is.
